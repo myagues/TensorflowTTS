@@ -327,7 +327,7 @@ class Seq2SeqBasedTrainer(BasedTrainer):
     def create_checkpoint_manager(self, saved_path=None, max_to_keep=10):
         """Create checkpoint management."""
         if saved_path is None:
-            saved_path = self.config["outdir"] + "/checkpoints/"
+            saved_path = os.path.join(self.config["outdir"], "checkpoints")
 
         os.makedirs(saved_path, exist_ok=True)
 
@@ -344,7 +344,7 @@ class Seq2SeqBasedTrainer(BasedTrainer):
         self.ckpt.steps.assign(self.steps)
         self.ckpt.epochs.assign(self.epochs)
         self.ckp_manager.save(checkpoint_number=self.steps)
-        self.model.save_weights(self.saved_path + "model-{}.h5".format(self.steps))
+        self.model.save_weights(os.path.join(self.saved_path, f"model-{self.steps}.h5"))
 
     def load_checkpoint(self, pretrained_path):
         """Load checkpoint."""
@@ -356,4 +356,4 @@ class Seq2SeqBasedTrainer(BasedTrainer):
         self.optimizer.iterations.assign(tf.cast(self.steps, tf.int64))
 
         # load weights.
-        self.model.load_weights(self.saved_path + "model-{}.h5".format(self.steps))
+        self.model.load_weights(os.path.join(self.saved_path, f"model-{self.steps}.h5"))

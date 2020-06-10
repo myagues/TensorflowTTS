@@ -39,10 +39,13 @@ def griffin_lim_lb(
     Returns:
         gl_lb (ndarray): generated wave.
     """
-    scaler = StandardScaler()
-    scaler.mean_, scaler.scale_ = np.load(stats_path)
+    if stats_path:
+        scaler = StandardScaler()
+        scaler.mean_, scaler.scale_ = np.load(stats_path)
+        mel_spec = np.power(10.0, scaler.inverse_transform(mel_spec)).T
+    else:
+        mel_spec = np.power(10.0, mel_spec).T
 
-    mel_spec = np.power(10.0, scaler.inverse_transform(mel_spec)).T
     mel_basis = librosa.filters.mel(
         dataset_config["sampling_rate"],
         n_fft=dataset_config["fft_size"],
@@ -66,16 +69,13 @@ def griffin_lim_lb(
 class TFGriffinLim(tf.keras.layers.Layer):
     """Griffin-Lim algorithm for phase reconstruction from mel spectrogram magnitude."""
 
-    def __init__(self, stats_path, dataset_config):
+    def __init__(self, dataset_config, stats_path=None):
         """Init GL params.
         Args:
-            stats_path (str): path to the `stats.npy` file containing norm statistics.
             dataset_config (Dict): dataset configuration parameters.
+            stats_path (str): path to the `stats.npy` file containing norm statistics.
         """
         super().__init__()
-        scaler = StandardScaler()
-        scaler.mean_, scaler.scale_ = np.load(stats_path)
-        self.scaler = scaler
         self.ds_config = dataset_config
         self.mel_basis = librosa.filters.mel(
             self.ds_config["sampling_rate"],
@@ -84,6 +84,11 @@ class TFGriffinLim(tf.keras.layers.Layer):
             fmin=self.ds_config["fmin"],
             fmax=self.ds_config["fmax"],
         )  # [num_mels, fft_size // 2 + 1]
+        self.scaler = None
+        if stats_path:
+            scaler = StandardScaler()
+            scaler.mean_, scaler.scale_ = np.load(stats_path)
+            self.scaler = scaler
 
     def save_wav(self, gl_tf, output_dir, wav_name):
         """Generate WAV file and save it.
@@ -122,8 +127,13 @@ class TFGriffinLim(tf.keras.layers.Layer):
         Returns:
             (tf.Tensor): reconstructed signal from GL algorithm.
         """
-        # de-normalize mel spectogram
-        mel_spec = tf.math.pow(10.0, mel_spec * self.scaler.scale_ + self.scaler.mean_)
+        # de-normalize mel spectogram if necessary
+        if self.scaler:
+            mel_spec = tf.math.pow(
+                10.0, mel_spec * self.scaler.scale_ + self.scaler.mean_
+            )
+        else:
+            mel_spec = tf.math.pow(10, mel_spec)
         inverse_mel = tf.linalg.pinv(self.mel_basis)
 
         # [:, num_mels] @ [fft_size // 2 + 1, num_mels].T

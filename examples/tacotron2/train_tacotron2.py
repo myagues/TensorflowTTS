@@ -12,47 +12,44 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Train Tacotron2."""
+"""Train Tacotron 2."""
 
 import argparse
 import logging
 import os
-import sys
-sys.path.append(".")
 
+import tensorflow_tts
+
+import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 import yaml
 
-import tensorflow_tts
-
-from tqdm import tqdm
-
 from tensorflow_tts.trainers import Seq2SeqBasedTrainer
-from examples.tacotron2.tacotron_dataset import CharactorMelDataset
-
 from tensorflow_tts.configs.tacotron2 import Tacotron2Config
-
 from tensorflow_tts.models import TFTacotron2
-
 from tensorflow_tts.optimizers import WarmUp
 from tensorflow_tts.optimizers import AdamWeightDecay
+from tensorflow_tts.utils import TFGriffinLim
+from tqdm import tqdm
+
+from tacotron_dataset import CharMelDataset
+
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"
 
 
 class Tacotron2Trainer(Seq2SeqBasedTrainer):
-    """Tacotron2 Trainer class based on Seq2SeqBasedTrainer."""
+    """Tacotron 2 Trainer class based on Seq2SeqBasedTrainer."""
 
     def __init__(
         self, config, steps=0, epochs=0, is_mixed_precision=False,
     ):
         """Initialize trainer.
-
         Args:
             steps (int): Initial global steps.
             epochs (int): Initial global epochs.
-            config (dict): Config dict loaded from yaml format configuration file.
-            is_mixed_precision (bool): Use mixed precision or not.
-
+            config (dict): Config dict loaded from YAML format configuration file.
+            is_mixed_precision (bool): Whether or not to use mixed precision.
         """
         super(Tacotron2Trainer, self).__init__(
             steps=steps,
@@ -60,21 +57,25 @@ class Tacotron2Trainer(Seq2SeqBasedTrainer):
             config=config,
             is_mixed_precision=is_mixed_precision,
         )
-        # define metrics to aggregates data and use tf.summary logs them
-        self.list_metrics_name = [
+        # define metrics to aggregates data and use tf.summary to log them
+        list_metrics_name = [
             "stop_token_loss",
             "mel_loss_before",
             "mel_loss_after",
             "guided_attention_loss",
         ]
-        self.init_train_eval_metrics(self.list_metrics_name)
-        self.reset_states_train()
-        self.reset_states_eval()
+        self.init_train_eval_metrics(list_metrics_name)
+        self.reset_metric_states(self.train_metrics)
+        self.reset_metric_states(self.eval_metrics)
 
         self.config = config
+        self.griffin_lim_tf = None
+        if "dataset_config_path" in config:
+            config = yaml.load(open(config["dataset_config_path"]), Loader=yaml.Loader)
+            self.griffin_lim_tf = TFGriffinLim(config, config["stats_path"])
 
     def init_train_eval_metrics(self, list_metrics_name):
-        """Init train and eval metrics to save it to tensorboard."""
+        """Init train and eval metrics to save it to TensorBoard."""
         self.train_metrics = {}
         self.eval_metrics = {}
         for name in list_metrics_name:
@@ -85,15 +86,10 @@ class Tacotron2Trainer(Seq2SeqBasedTrainer):
                 {name: tf.keras.metrics.Mean(name="eval_" + name, dtype=tf.float32)}
             )
 
-    def reset_states_train(self):
-        """Reset train metrics after save it to tensorboard."""
-        for metric in self.train_metrics.keys():
-            self.train_metrics[metric].reset_states()
-
-    def reset_states_eval(self):
-        """Reset eval metrics after save it to tensorboard."""
-        for metric in self.eval_metrics.keys():
-            self.eval_metrics[metric].reset_states()
+    def reset_metric_states(self, metric_dict):
+        """Reset metrics after writing to TensorBoard."""
+        for metric in metric_dict.values():
+            metric.reset_states()
 
     def compile(self, model, optimizer):
         super().compile(model, optimizer)
@@ -112,10 +108,8 @@ class Tacotron2Trainer(Seq2SeqBasedTrainer):
 
     def _train_step(self, batch):
         """Train model one step."""
-        charactor, char_length, mel, mel_length, guided_attention = batch
-        self._one_step_tacotron2(
-            charactor, char_length, mel, mel_length, guided_attention
-        )
+        batch_data = map(batch.get, ["char", "char_len", "mel", "mel_len", "ga"])
+        self._one_step_tacotron2(*batch_data)
 
         # update counts
         self.steps += 1
@@ -130,58 +124,32 @@ class Tacotron2Trainer(Seq2SeqBasedTrainer):
                 self.steps - self.config["start_schedule_teacher_forcing"]
             )
             if self.steps == self.config["start_schedule_teacher_forcing"]:
-                logging.info(
-                    f"(Steps: {self.steps}) Starting apply schedule teacher forcing."
-                )
+                logging.info("(Steps: %d) Start schedule teacher forcing.", self.steps)
 
     @tf.function(experimental_relax_shapes=True)
-    def _one_step_tacotron2(
-        self, charactor, char_length, mel, mel_length, guided_attention
-    ):
+    def _one_step_tacotron2(self, char, char_length, mel, mel_length, guided_att):
+        bs, seq_len, _ = tf.unstack(tf.shape(mel))
         with tf.GradientTape() as tape:
-            (
-                mel_outputs,
-                post_mel_outputs,
-                stop_outputs,
-                alignment_historys,
-            ) = self.model(
-                charactor,
+            (mel_outputs, post_mel_outputs, stop_outputs, alignments) = self.model(
+                char,
                 char_length,
-                speaker_ids=tf.zeros(shape=[tf.shape(charactor)[0]]),
+                speaker_ids=tf.zeros([bs]),
                 mel_outputs=mel,
                 mel_lengths=mel_length,
                 training=True,
             )
-
-            # calculate mel loss.
+            # calculate mel loss
             mel_loss_before = self.mae(mel, mel_outputs)
             mel_loss_after = self.mae(mel, post_mel_outputs)
 
-            # calculate stop grounth truth based-on mel_length.
-            max_mel_length = (
-                tf.reduce_max(mel_length)
-                if self.config["use_fixed_shapes"] is False
-                else [self.config["max_mel_length"]]
-            )
-            stop_gts = tf.expand_dims(
-                tf.range(tf.reduce_max(max_mel_length), dtype=tf.int32), 0
-            )  # [1, max_len]
-            stop_gts = tf.tile(stop_gts, [tf.shape(mel_length)[0], 1])  # [B, max_len]
-            stop_gts = tf.cast(
-                tf.math.greater_equal(stop_gts, tf.expand_dims(mel_length, 1)),
-                tf.float32,
-            )
-
+            # calculate stop ground truth based on "mel_len"
+            stop_gts = ~tf.sequence_mask(mel_length, seq_len)
             stop_token_loss = self.binary_crossentropy(stop_gts, stop_outputs)
 
-            # calculate guided attention loss.
-            attention_masks = tf.cast(
-                tf.math.not_equal(guided_attention, -1.0), tf.float32
-            )
-            loss_att = tf.reduce_sum(
-                tf.abs(alignment_historys * guided_attention) * attention_masks
-            )
-            loss_att /= tf.reduce_sum(attention_masks)
+            # calculate guided attention loss
+            att_mask = tf.cast(tf.math.not_equal(guided_att, -1.0), tf.float32)
+            loss_att = tf.reduce_sum(tf.abs(alignments * guided_att) * att_mask)
+            loss_att /= tf.reduce_sum(att_mask)
 
             # sum all loss
             loss = stop_token_loss + mel_loss_before + mel_loss_after + loss_att
@@ -199,7 +167,6 @@ class Tacotron2Trainer(Seq2SeqBasedTrainer):
         self.optimizer.apply_gradients(
             zip(gradients, self.model.trainable_variables), 5.0
         )
-
         # accumulate loss into metrics
         self.train_metrics["stop_token_loss"].update_state(stop_token_loss)
         self.train_metrics["mel_loss_before"].update_state(mel_loss_before)
@@ -208,177 +175,157 @@ class Tacotron2Trainer(Seq2SeqBasedTrainer):
 
     def _eval_epoch(self):
         """Evaluate model one epoch."""
-        logging.info(f"(Steps: {self.steps}) Start evaluation.")
+        logging.info("(Steps: %d) Start evaluation.", self.steps)
 
         # set traing = False on decoder_cell
         self.model.decoder.cell.training = False
 
         # calculate loss for each batch
-        for eval_steps_per_epoch, batch in enumerate(
-            tqdm(self.eval_data_loader, desc="[eval]"), 1
-        ):
+        for idx, batch in enumerate(tqdm(self.eval_data_loader, desc="[eval]"), 1):
             # eval one step
-            charactor, char_length, mel, mel_length, guided_attention = batch
-            self._eval_step(charactor, char_length, mel, mel_length, guided_attention)
+            batch_items = map(batch.get, ["char", "char_len", "mel", "mel_len", "ga"])
+            mel_outputs, post_mel_outputs, _, alignments = self._eval_step(*batch_items)
 
-            if eval_steps_per_epoch <= self.config["num_save_intermediate_results"]:
-                # save intermedia
-                self.generate_and_save_intermediate_result(batch)
+            if idx <= self.config["num_save_intermediate_results"]:
+                self.generate_and_save_intermediate_result(
+                    batch, mel_outputs, post_mel_outputs, alignments
+                )
 
         logging.info(
-            f"(Steps: {self.steps}) Finished evaluation "
-            f"({eval_steps_per_epoch} steps per epoch)."
+            "(Steps: %d) Finished evaluation (%d steps per epoch).", self.steps, idx
         )
-
         # average loss
-        for key in self.eval_metrics.keys():
-            logging.info(
-                f"(Steps: {self.steps}) eval_{key} = {self.eval_metrics[key].result():.4f}."
-            )
+        for key, val in self.eval_metrics.items():
+            logging.info("(Steps: %d) eval_%s = %.4f.", self.steps, key, val.result())
 
         # record
         self._write_to_tensorboard(self.eval_metrics, stage="eval")
 
         # reset
-        self.reset_states_eval()
+        self.reset_metric_states(self.eval_metrics)
 
         # enable training = True on decoder_cell
         self.model.decoder.cell.training = True
 
     @tf.function(experimental_relax_shapes=True)
-    def _eval_step(self, charactor, char_length, mel, mel_length, guided_attention):
+    def _eval_step(self, char, char_length, mel, mel_length, guided_att):
         """Evaluate model one step."""
-        mel_outputs, post_mel_outputs, stop_outputs, alignment_historys = self.model(
-            charactor,
+        bs, seq_len, _ = tf.unstack(tf.shape(mel))
+        mel_outputs, post_mel_outputs, stop_outputs, alignments = self.model(
+            char,
             char_length,
-            speaker_ids=tf.zeros(shape=[tf.shape(charactor)[0]]),
+            speaker_ids=tf.zeros([bs]),
             mel_outputs=mel,
             mel_lengths=mel_length,
             training=False,
         )
-
-        # calculate mel loss.
+        # calculate mel loss
         mel_loss_before = self.mae(mel, mel_outputs)
         mel_loss_after = self.mae(mel, post_mel_outputs)
 
-        # calculate stop grounth truth based-on mel_length.
-        stop_gts = tf.expand_dims(
-            tf.range(tf.reduce_max(mel_length), dtype=tf.int32), 0
-        )  # [1, max_len]
-        stop_gts = tf.tile(stop_gts, [tf.shape(mel_length)[0], 1])  # [B, max_len]
-        stop_gts = tf.cast(
-            tf.math.greater_equal(stop_gts, tf.expand_dims(mel_length, 1)), tf.float32
-        )
-
+        # calculate stop ground truth based on "mel_length"
+        stop_gts = ~tf.sequence_mask(mel_length, seq_len)
         stop_token_loss = self.binary_crossentropy(stop_gts, stop_outputs)
 
-        # calculate guided attention loss.
-        attention_masks = tf.cast(tf.math.not_equal(guided_attention, -1.0), tf.float32)
-        loss_att = tf.reduce_sum(
-            tf.abs(alignment_historys * guided_attention) * attention_masks
-        )
-        loss_att /= tf.reduce_sum(attention_masks)
+        # calculate guided attention loss
+        att_mask = tf.cast(tf.math.not_equal(guided_att, -1.0), tf.float32)
+        loss_att = tf.reduce_sum(tf.abs(alignments * guided_att) * att_mask)
+        loss_att /= tf.reduce_sum(att_mask)
 
         # accumulate loss into metrics
         self.eval_metrics["stop_token_loss"].update_state(stop_token_loss)
         self.eval_metrics["mel_loss_before"].update_state(mel_loss_before)
         self.eval_metrics["mel_loss_after"].update_state(mel_loss_after)
         self.eval_metrics["guided_attention_loss"].update_state(loss_att)
+        return mel_outputs, post_mel_outputs, stop_outputs, alignments
 
     def _check_log_interval(self):
-        """Log to tensorboard."""
+        """Log to TensorBoard."""
         if self.steps % self.config["log_interval_steps"] == 0:
-            for metric_name in self.list_metrics_name:
+            for key, val in self.train_metrics.items():
                 logging.info(
-                    f"(Step: {self.steps}) train_{metric_name} = {self.train_metrics[metric_name].result():.4f}."
+                    "(Step: %d) train_%s = %.4f.", self.steps, key, val.result()
                 )
             self._write_to_tensorboard(self.train_metrics, stage="train")
-
-            # reset
-            self.reset_states_train()
+            # reset metric states
+            self.reset_metric_states(self.train_metrics)
 
     @tf.function(experimental_relax_shapes=True)
-    def predict(self, charactor, char_length, mel, mel_length):
+    def predict(self, char, char_length, mel, mel_length):
         """Predict."""
-        mel_outputs, post_mel_outputs, _, alignment = self.model(
-            charactor,
+        bs, _, _ = tf.unstack(tf.shape(mel))
+        mel_outputs, post_mel_outputs, _, alignments = self.model(
+            char,
             char_length,
-            speaker_ids=tf.zeros(shape=[tf.shape(charactor)[0]]),
+            speaker_ids=tf.zeros([bs]),
             mel_outputs=mel,
             mel_lengths=mel_length,
             training=False,
         )
-        return mel_outputs, post_mel_outputs, alignment
+        return mel_outputs, post_mel_outputs, alignments
 
-    def generate_and_save_intermediate_result(self, batch):
+    def generate_and_save_intermediate_result(
+        self, batch, mel_before, mel_after, alignments
+    ):
         """Generate and save intermediate result."""
-        import matplotlib.pyplot as plt
-
-        # unpack input.
-        charactor, char_length, mel, mel_length, _ = batch
-
-        # predict with tf.function for faster.
-        masked_mel_before, masked_mel_after, alignments = self.predict(
-            charactor, char_length, mel, mel_length
-        )
-
         # check directory
-        dirname = os.path.join(self.config["outdir"], f"predictions/{self.steps}steps")
-        if not os.path.exists(dirname):
-            os.makedirs(dirname)
+        pred_output_dir = os.path.join(
+            self.config["outdir"], "predictions", f"{self.steps}_steps"
+        )
+        os.makedirs(pred_output_dir, exist_ok=True)
 
-        for idx, (mel_gt, mel_pred_before, mel_pred_after, alignment) in enumerate(
-            zip(mel, masked_mel_before, masked_mel_after, alignments), 1
-        ):
-            mel_gt = tf.reshape(mel_gt, (-1, 80)).numpy()  # [length, 80]
-            mel_pred_before = tf.reshape(
-                mel_pred_before, (-1, 80)
-            ).numpy()  # [length, 80]
-            mel_pred_after = tf.reshape(
-                mel_pred_after, (-1, 80)
-            ).numpy()  # [length, 80]
+        # get audio samples output with Griffin-Lim algorithm
+        if self.griffin_lim_tf:
+            tf_wav = self.griffin_lim_tf(mel_after)
 
-            # plot figure and save it
-            figname = os.path.join(dirname, f"{idx}.png")
-            fig = plt.figure(figsize=(10, 8))
-            ax1 = fig.add_subplot(311)
-            ax2 = fig.add_subplot(312)
-            ax3 = fig.add_subplot(313)
-            im = ax1.imshow(np.rot90(mel_gt), aspect="auto", interpolation="none")
-            ax1.set_title("Target Mel-Spectrogram")
-            fig.colorbar(mappable=im, shrink=0.65, orientation="horizontal", ax=ax1)
-            ax2.set_title(f"Predicted Mel-before-Spectrogram @ {self.steps} steps")
-            im = ax2.imshow(
-                np.rot90(mel_pred_before), aspect="auto", interpolation="none"
+        num_mels = self.config["tacotron2_params"]["n_mels"]
+        items = zip(
+            batch["utt_id"], batch["mel"], mel_before, mel_after, alignments, tf_wav
+        )
+        for (utt_id, mel_gt, mel_pred_before, mel_pred_after, alignment, wav) in items:
+            # reshape outputs and convert to values
+            mel_gt = tf.reshape(mel_gt, (-1, num_mels)).numpy()
+            mel_pred_before = tf.reshape(mel_pred_before, (-1, num_mels)).numpy()
+            mel_pred_after = tf.reshape(mel_pred_after, (-1, num_mels)).numpy()
+            utt_id_str = utt_id.numpy().decode("utf8")
+
+            # save audio file
+            if self.griffin_lim_tf:
+                self.griffin_lim_tf.save_wav(wav, pred_output_dir, utt_id_str)
+
+            # plot mel
+            figname = os.path.join(pred_output_dir, f"{utt_id_str}.png")
+            fig, axes = plt.subplots(figsize=(10, 8), nrows=3)
+            for ax, data in zip(axes, [mel_gt, mel_pred_before, mel_pred_after]):
+                im = ax.imshow(np.rot90(data), aspect="auto", interpolation="none")
+                fig.colorbar(im, pad=0.02, aspect=15, orientation="vertical", ax=ax)
+            axes[0].set_title(f"Target mel spectrogram ({utt_id_str})")
+            axes[1].set_title(
+                f"Predicted mel spectrogram before post-net @ {self.steps} steps"
             )
-            fig.colorbar(mappable=im, shrink=0.65, orientation="horizontal", ax=ax2)
-            ax3.set_title(f"Predicted Mel-after-Spectrogram @ {self.steps} steps")
-            im = ax3.imshow(
-                np.rot90(mel_pred_after), aspect="auto", interpolation="none"
+            axes[2].set_title(
+                f"Predicted mel spectrogram after post-net @ {self.steps} steps"
             )
-            fig.colorbar(mappable=im, shrink=0.65, orientation="horizontal", ax=ax3)
             plt.tight_layout()
-            plt.savefig(figname)
+            plt.savefig(figname, bbox_inches="tight")
             plt.close()
 
             # plot alignment
-            figname = os.path.join(dirname, f"{idx}_alignment.png")
-            fig = plt.figure(figsize=(8, 6))
-            ax = fig.add_subplot(111)
+            figname = os.path.join(pred_output_dir, f"{utt_id_str}_alignment.png")
+            fig, ax = plt.subplots(figsize=(8, 6))
             ax.set_title(f"Alignment @ {self.steps} steps")
             im = ax.imshow(
                 alignment, aspect="auto", origin="lower", interpolation="none"
             )
-            fig.colorbar(im, ax=ax)
-            xlabel = "Decoder timestep"
-            plt.xlabel(xlabel)
-            plt.ylabel("Encoder timestep")
+            fig.colorbar(im, aspect=15, ax=ax)
+            ax.set_xlabel("Decoder timestep")
+            ax.set_ylabel("Encoder timestep")
             plt.tight_layout()
-            plt.savefig(figname)
+            plt.savefig(figname, bbox_inches="tight")
             plt.close()
 
     def _check_train_finish(self):
-        """Check training finished."""
+        """Check whether or not training has finished."""
         if self.steps >= self.config["train_max_steps"]:
             self.finish_train = True
 
@@ -388,157 +335,125 @@ class Tacotron2Trainer(Seq2SeqBasedTrainer):
         self.create_checkpoint_manager(saved_path=saved_path, max_to_keep=10000)
         if len(resume) > 2:
             self.load_checkpoint(resume)
-            logging.info(f"Successfully resumed from {resume}.")
+            logging.info("Successfully resumed from %s.", resume)
         self.run()
 
 
 def main():
     """Run training process."""
-    parser = argparse.ArgumentParser(
-        description="Train FastSpeech (See detail in tensorflow_tts/bin/train-fastspeech.py)"
-    )
+    parser = argparse.ArgumentParser(description="Train Tacotron 2.")
     parser.add_argument(
-        "--train-dir",
-        default=None,
+        "--train_dir",
+        default=argparse.SUPPRESS,
         type=str,
-        help="directory including training data. ",
+        help="Directory containing training data.",
     )
     parser.add_argument(
-        "--dev-dir",
-        default=None,
+        "--valid_dir",
+        default=argparse.SUPPRESS,
         type=str,
-        help="directory including development data. ",
+        help="Directory containing validation data.",
     )
     parser.add_argument(
-        "--use-norm", default=1, type=int, help="usr norm-mels for train or raw."
+        "--use_norm",
+        action="store_true",
+        help="Whether or not to use normalized features.",
     )
     parser.add_argument(
-        "--outdir", type=str, required=True, help="directory to save checkpoints."
+        "--stats_path",
+        default=argparse.SUPPRESS,
+        type=str,
+        help="Path to statistics file with mean and std values for standardization.",
     )
     parser.add_argument(
-        "--config", type=str, required=True, help="yaml format configuration file."
+        "--outdir",
+        default=argparse.SUPPRESS,
+        type=str,
+        help="Output directory where checkpoints and results will be saved.",
+    )
+    parser.add_argument(
+        "--config", type=str, required=True, help="YAML format configuration file."
     )
     parser.add_argument(
         "--resume",
         default="",
         type=str,
         nargs="?",
-        help='checkpoint file path to resume training. (default="")',
+        help="Checkpoint file path to resume training. (default='')",
     )
     parser.add_argument(
         "--verbose",
         type=int,
         default=1,
-        help="logging level. higher is more logging. (default=1)",
+        choices=[0, 1, 2],
+        help="Logging level. 0: DEBUG, 1: INFO, 2: WARN.",
     )
     parser.add_argument(
         "--mixed_precision",
-        default=0,
-        type=int,
-        help="using mixed precision for generator or not.",
+        action="store_true",
+        help="Whether or not to use mixed precision training.",
     )
     args = parser.parse_args()
 
-    # set mixed precision config
-    if args.mixed_precision == 1:
-        tf.config.optimizer.set_experimental_options({"auto_mixed_precision": True})
-
-    args.mixed_precision = bool(args.mixed_precision)
-    args.use_norm = bool(args.use_norm)
-
-    # set logger
-    if args.verbose > 1:
-        logging.basicConfig(
-            level=logging.DEBUG,
-            stream=sys.stdout,
-            format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s",
-        )
-    elif args.verbose > 0:
-        logging.basicConfig(
-            level=logging.INFO,
-            stream=sys.stdout,
-            format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s",
-        )
-    else:
-        logging.basicConfig(
-            level=logging.WARN,
-            stream=sys.stdout,
-            format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s",
-        )
-        logging.warning("Skip DEBUG/INFO messages")
-
-    # check directory existence
-    if not os.path.exists(args.outdir):
-        os.makedirs(args.outdir)
-
-    # check arguments
-    if args.train_dir is None:
-        raise ValueError("Please specify --train-dir")
-    if args.dev_dir is None:
-        raise ValueError("Please specify --valid-dir")
-
     # load and save config
-    with open(args.config) as f:
-        config = yaml.load(f, Loader=yaml.Loader)
+    config = yaml.load(open(args.config), Loader=yaml.Loader)
     config.update(vars(args))
     config["version"] = tensorflow_tts.__version__
 
-    # get dataset
-    if config["remove_short_samples"]:
-        mel_length_threshold = config["mel_length_threshold"]
-    else:
-        mel_length_threshold = None
+    # set logger and print parameters
+    fmt = "%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s"
+    log_level = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARN}
+    logging.basicConfig(level=log_level[config["verbose"]], format=fmt)
+    _ = [logging.info("%s = %s", key, value) for key, value in config.items()]
 
-    if config["format"] == "npy":
-        charactor_query = "*-ids.npy"
-        mel_query = "*-raw-feats.npy" if args.use_norm is False else "*-norm-feats.npy"
-        charactor_load_fn = np.load
-        mel_load_fn = np.load
-    else:
-        raise ValueError("Only npy are supported.")
-
-    train_dataset = CharactorMelDataset(
-        root_dir=args.train_dir,
-        charactor_query=charactor_query,
-        mel_query=mel_query,
-        charactor_load_fn=charactor_load_fn,
-        mel_load_fn=mel_load_fn,
-        mel_length_threshold=mel_length_threshold,
-        return_utt_id=False,
-        reduction_factor=config["tacotron2_params"]["reduction_factor"],
-        use_fixed_shapes=config["use_fixed_shapes"],
+    # check required arguments
+    missing_dirs = list(
+        filter(lambda x: x not in config, ["train_dir", "valid_dir", "outdir"])
     )
+    if missing_dirs:
+        raise ValueError(f"{missing_dirs}.")
+    if config["use_norm"] and "stats_path" not in config:
+        raise ValueError("'--stats_path' should be provided when using '--use_norm'.")
+    if not config["use_norm"]:
+        config["stats_path"] = None
 
-    # update max_mel_length and max_char_length to config
-    config.update({"max_mel_length": int(train_dataset.max_mel_length)})
-    config.update({"max_char_length": int(train_dataset.max_char_length)})
+    # check output directory
+    os.makedirs(config["outdir"], exist_ok=True)
 
-    with open(os.path.join(args.outdir, "config.yml"), "w") as f:
+    with open(os.path.join(config["outdir"], "config.yml"), "w") as f:
         yaml.dump(config, f, Dumper=yaml.Dumper)
-    for key, value in config.items():
-        logging.info(f"{key} = {value}")
 
-    train_dataset = train_dataset.create(
-        is_shuffle=config["is_shuffle"],
-        allow_cache=config["allow_cache"],
-        batch_size=config["batch_size"],
-    )
+    # set mixed precision config
+    if config["mixed_precision"]:
+        tf.config.optimizer.set_experimental_options({"auto_mixed_precision": True})
 
-    valid_dataset = CharactorMelDataset(
-        root_dir=args.dev_dir,
-        charactor_query=charactor_query,
-        mel_query=mel_query,
-        charactor_load_fn=charactor_load_fn,
-        mel_load_fn=mel_load_fn,
-        mel_length_threshold=mel_length_threshold,
-        return_utt_id=False,
+    # get dataset
+    train_dataset = CharMelDataset(
+        dataset_dir=config["train_dir"],
+        use_norm=config["use_norm"],
+        stats_path=config["stats_path"],
+        return_guided_attention=True,
         reduction_factor=config["tacotron2_params"]["reduction_factor"],
-        use_fixed_shapes=False,  # don't need apply fixed shape for evaluation.
+        n_mels=config["tacotron2_params"]["n_mels"],
+        use_fixed_shapes=config["use_fixed_shapes"],
+        mel_len_threshold=config["mel_length_threshold"],
     ).create(
-        is_shuffle=config["is_shuffle"],
-        allow_cache=config["allow_cache"],
         batch_size=config["batch_size"],
+        shuffle=config["is_shuffle"],
+        allow_cache=config["allow_cache"],
+        training=True,
     )
+
+    valid_dataset = CharMelDataset(
+        dataset_dir=config["valid_dir"],
+        use_norm=config["use_norm"],
+        stats_path=config["stats_path"],
+        return_guided_attention=True,
+        reduction_factor=config["tacotron2_params"]["reduction_factor"],
+        n_mels=config["tacotron2_params"]["n_mels"],
+        use_fixed_shapes=False,
+        mel_len_threshold=config["mel_length_threshold"],
+    ).create(batch_size=config["batch_size"], allow_cache=config["allow_cache"])
 
     tacotron_config = Tacotron2Config(**config["tacotron2_params"])
     tacotron2 = TFTacotron2(config=tacotron_config, training=True, name="tacotron2")
@@ -547,10 +462,10 @@ def main():
 
     # define trainer
     trainer = Tacotron2Trainer(
-        config=config, steps=0, epochs=0, is_mixed_precision=args.mixed_precision
+        config=config, steps=0, epochs=0, is_mixed_precision=config["mixed_precision"]
     )
 
-    # AdamW for tacotron2
+    # AdamW for Tacotron 2
     learning_rate_fn = tf.keras.optimizers.schedules.PolynomialDecay(
         initial_learning_rate=config["optimizer_params"]["initial_learning_rate"],
         decay_steps=config["optimizer_params"]["decay_steps"],
@@ -564,7 +479,6 @@ def main():
             config["train_max_steps"] * config["optimizer_params"]["warmup_proportion"]
         ),
     )
-
     optimizer = AdamWeightDecay(
         learning_rate=learning_rate_fn,
         weight_decay_rate=config["optimizer_params"]["weight_decay"],
@@ -582,12 +496,12 @@ def main():
         trainer.fit(
             train_dataset,
             valid_dataset,
-            saved_path=os.path.join(config["outdir"], "checkpoints/"),
-            resume=args.resume,
+            saved_path=os.path.join(config["outdir"], "checkpoints"),
+            resume=config["resume"],
         )
     except KeyboardInterrupt:
         trainer.save_checkpoint()
-        logging.info(f"Successfully saved checkpoint @ {trainer.steps}steps.")
+        logging.info("Successfully saved checkpoint @ %d steps.", trainer.steps)
 
 
 if __name__ == "__main__":
